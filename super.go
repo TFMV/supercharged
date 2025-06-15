@@ -3,7 +3,6 @@ package supercharged
 import (
 	"context"
 	"fmt"
-	"math"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -67,26 +66,36 @@ func DetectAnomalies(ctx context.Context, col arrow.Array, threshold float64) (*
 
 	// 1. Compute mean and variance manually
 	mean, variance := computeMeanAndVariance(floatCol)
-	stdDev := math.Sqrt(variance)
 
 	// 2. Create scalars for broadcasting
 	meanScalar := scalar.NewFloat64Scalar(mean)
+	varianceScalar := scalar.NewFloat64Scalar(variance)
+
+	// 3. Compute standard deviation using Arrow compute
+	stdDevResult, err := compute.CallFunction(ctx, "sqrt", nil, compute.NewDatum(varianceScalar))
+	if err != nil {
+		return nil, fmt.Errorf("sqrt computation: %w", err)
+	}
+	defer stdDevResult.Release()
+
+	stdDevDatum := stdDevResult.(*compute.ScalarDatum)
+	stdDev := stdDevDatum.Value.(*scalar.Float64).Value
 	stdDevScalar := scalar.NewFloat64Scalar(stdDev)
 
-	// 3. Subtract mean from each value
+	// 4. Subtract mean from each value
 	diffResult, err := compute.CallFunction(ctx, "subtract", nil, compute.NewDatum(col), compute.NewDatum(meanScalar))
 	if err != nil {
 		return nil, fmt.Errorf("subtract computation: %w", err)
 	}
 	defer diffResult.Release()
 
-	// 4. Divide by standard deviation to get z-scores
+	// 5. Divide by standard deviation to get z-scores
 	zscoreResult, err := compute.CallFunction(ctx, "divide", nil, diffResult, compute.NewDatum(stdDevScalar))
 	if err != nil {
 		return nil, fmt.Errorf("divide computation: %w", err)
 	}
 
-	// 5. Take absolute value of z-scores
+	// 6. Take absolute value of z-scores
 	absResult, err := compute.CallFunction(ctx, "abs", nil, zscoreResult)
 	if err != nil {
 		return nil, fmt.Errorf("abs computation: %w", err)
@@ -97,7 +106,7 @@ func DetectAnomalies(ctx context.Context, col arrow.Array, threshold float64) (*
 	zscoreDatum := zscoreResult.(*compute.ArrayDatum)
 	zscore := array.MakeFromData(zscoreDatum.Value).(*array.Float64)
 
-	// 6. Compare with threshold using Arrow compute
+	// 7. Compare with threshold using Arrow compute
 	thresholdScalar := scalar.NewFloat64Scalar(threshold)
 	compResult, err := compute.CallFunction(ctx, "greater_equal", nil, absResult, compute.NewDatum(thresholdScalar))
 	if err != nil {
