@@ -8,7 +8,6 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/compute"
-	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/arrow-go/v18/arrow/scalar"
 )
 
@@ -98,17 +97,20 @@ func DetectAnomalies(ctx context.Context, col arrow.Array, threshold float64) (*
 	zscoreDatum := zscoreResult.(*compute.ArrayDatum)
 	zscore := array.MakeFromData(zscoreDatum.Value).(*array.Float64)
 
-	// 6. Compare with threshold in Go
-	maskBuilder := array.NewBooleanBuilder(memory.DefaultAllocator)
-	defer maskBuilder.Release()
-
-	// Build mask by comparing absolute z-scores with threshold
-	for i := range zscore.Len() {
-		maskBuilder.Append(math.Abs(zscore.Value(i)) >= threshold)
+	// 6. Compare with threshold using Arrow compute
+	thresholdScalar := scalar.NewFloat64Scalar(threshold)
+	compResult, err := compute.CallFunction(ctx, "greater_equal", nil, absResult, compute.NewDatum(thresholdScalar))
+	if err != nil {
+		return nil, fmt.Errorf("threshold comparison: %w", err)
 	}
+	defer compResult.Release()
+
+	// Get the boolean mask from the comparison result
+	maskDatum := compResult.(*compute.ArrayDatum)
+	mask := array.MakeFromData(maskDatum.Value).(*array.Boolean)
 
 	return &Result{
-		Mask:   maskBuilder.NewBooleanArray(),
+		Mask:   mask,
 		Zscore: zscore,
 	}, nil
 }
