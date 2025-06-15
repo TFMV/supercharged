@@ -44,7 +44,10 @@ func main() {
 	}
 
 	// rewind
-	f.Seek(0, 0)
+	if _, err := f.Seek(0, 0); err != nil {
+		fmt.Fprintf(os.Stderr, "seek: %v\n", err)
+		os.Exit(1)
+	}
 
 	// read column
 	arr, err := csvreader.NewCSVReader(f, schema).ReadSingleColumn(f, columnName)
@@ -92,7 +95,10 @@ func main() {
 	if jsonOut {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
-		enc.Encode(out)
+		if err := enc.Encode(out); err != nil {
+			fmt.Fprintf(os.Stderr, "encode: %v\n", err)
+			os.Exit(1)
+		}
 	} else {
 		fmt.Printf("Total: %d\nAnomalies: %v\n", out.Count, out.Anomalies)
 	}

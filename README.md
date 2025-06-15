@@ -51,7 +51,7 @@ go test ./...
 ### Benchmarking
 
 ```bash
-go test -bench=. ./anomaly
+go test -bench=.
 ```
 
 ## License

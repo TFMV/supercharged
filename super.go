@@ -1,15 +1,15 @@
-// Package supercharged provides a supercharged version of the anomaly detection algorithm.
 package supercharged
 
 import (
 	"context"
 	"fmt"
+	"math"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/compute"
-	"github.com/apache/arrow-go/v18/arrow/compute/exprs"
-	"github.com/substrait-io/substrait-go/v3/expr"
+	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/apache/arrow-go/v18/arrow/scalar"
 )
 
 // Result holds mask and z-scores for anomalies.
@@ -28,99 +28,87 @@ func (r *Result) Release() {
 	}
 }
 
-// DetectAnomalies computes z-scores and a boolean mask using exprs.Exec.
-func DetectAnomalies(ctx context.Context, col *array.Float64, threshold float64) (*Result, error) {
-	if col == nil {
-		return nil, fmt.Errorf("input array is nil")
+// computeMeanAndVariance calculates mean and variance for a Float64 array
+func computeMeanAndVariance(col *array.Float64) (mean, variance float64) {
+	var sum, sumsq float64
+	var count int
+	for i := 0; i < col.Len(); i++ {
+		if col.IsNull(i) {
+			continue
+		}
+		v := col.Value(i)
+		sum += v
+		sumsq += v * v
+		count++
+	}
+	if count == 0 {
+		return 0, 0
+	}
+	mean = sum / float64(count)
+	// Population variance: sum of squared differences from mean
+	variance = 0
+	for i := 0; i < col.Len(); i++ {
+		if col.IsNull(i) {
+			continue
+		}
+		diff := col.Value(i) - mean
+		variance += diff * diff
+	}
+	variance /= float64(count)
+	return
+}
+
+// DetectAnomalies computes z-scores and a boolean mask using Arrow compute functions.
+func DetectAnomalies(ctx context.Context, col arrow.Array, threshold float64) (*Result, error) {
+	// Ensure we have a Float64 array
+	floatCol, ok := col.(*array.Float64)
+	if !ok {
+		return nil, fmt.Errorf("input must be Float64 array, got %T", col)
 	}
 
-	// Build a schema and a single-column record batch
-	schema := arrow.NewSchema(
-		[]arrow.Field{{Name: "col", Type: arrow.PrimitiveTypes.Float64, Nullable: true}},
-		nil,
-	)
-	batch := array.NewRecord(
-		schema,
-		[]arrow.Array{col},
-		int64(col.Len()),
-	)
+	// 1. Compute mean and variance manually
+	mean, variance := computeMeanAndVariance(floatCol)
+	stdDev := math.Sqrt(variance)
 
-	// Create expression builder with default extension set
-	extSet := exprs.NewDefaultExtensionSet()
-	builder := exprs.NewExprBuilder(extSet)
-	if err := builder.SetInputSchema(schema); err != nil {
-		return nil, fmt.Errorf("set schema: %w", err)
-	}
+	// 2. Create scalars for broadcasting
+	meanScalar := scalar.NewFloat64Scalar(mean)
+	stdDevScalar := scalar.NewFloat64Scalar(stdDev)
 
-	// Build expression: z = abs((col - mean(col)) / stddev_pop(col))
-	colRef := builder.FieldRef("col")
-	meanCall, err := builder.CallScalar("mean", nil, colRef)
+	// 3. Subtract mean from each value
+	diffResult, err := compute.CallFunction(ctx, "subtract", nil, compute.NewDatum(col), compute.NewDatum(meanScalar))
 	if err != nil {
-		return nil, fmt.Errorf("mean call: %w", err)
+		return nil, fmt.Errorf("subtract computation: %w", err)
 	}
+	defer diffResult.Release()
 
-	stdCall, err := builder.CallScalar("stddev_pop", nil, colRef)
+	// 4. Divide by standard deviation to get z-scores
+	zscoreResult, err := compute.CallFunction(ctx, "divide", nil, diffResult, compute.NewDatum(stdDevScalar))
 	if err != nil {
-		return nil, fmt.Errorf("stddev call: %w", err)
+		return nil, fmt.Errorf("divide computation: %w", err)
 	}
 
-	subCall, err := builder.CallScalar("subtract", nil, colRef, meanCall)
+	// 5. Take absolute value of z-scores
+	absResult, err := compute.CallFunction(ctx, "abs", nil, zscoreResult)
 	if err != nil {
-		return nil, fmt.Errorf("subtract call: %w", err)
+		return nil, fmt.Errorf("abs computation: %w", err)
+	}
+	defer absResult.Release()
+
+	// Get z-scores array
+	zscoreDatum := zscoreResult.(*compute.ArrayDatum)
+	zscore := array.MakeFromData(zscoreDatum.Value).(*array.Float64)
+
+	// 6. Compare with threshold in Go
+	maskBuilder := array.NewBooleanBuilder(memory.DefaultAllocator)
+	defer maskBuilder.Release()
+
+	// Build mask by comparing absolute z-scores with threshold
+	for i := range zscore.Len() {
+		maskBuilder.Append(math.Abs(zscore.Value(i)) >= threshold)
 	}
 
-	divCall, err := builder.CallScalar("divide", nil, subCall, stdCall)
-	if err != nil {
-		return nil, fmt.Errorf("divide call: %w", err)
-	}
-
-	absCall, err := builder.CallScalar("abs", nil, divCall)
-	if err != nil {
-		return nil, fmt.Errorf("abs call: %w", err)
-	}
-
-	// Build z-score expression
-	zExpr, err := absCall.BuildExpr()
-	if err != nil {
-		return nil, fmt.Errorf("build zscore expr: %w", err)
-	}
-
-	// Execute z-score expression
-	zDatum, err := exprs.ExecuteScalarExpression(ctx, schema, zExpr, compute.NewDatumWithoutOwning(batch))
-	if err != nil {
-		return nil, fmt.Errorf("exec zscore: %w", err)
-	}
-	defer zDatum.Release()
-
-	// Build and execute mask expression: z > threshold
-	threshLit := expr.NewPrimitiveLiteral(threshold, false)
-	gtCall, err := builder.CallScalar("greater", nil, absCall, builder.Literal(threshLit))
-	if err != nil {
-		return nil, fmt.Errorf("greater call: %w", err)
-	}
-
-	gtExpr, err := gtCall.BuildExpr()
-	if err != nil {
-		return nil, fmt.Errorf("build mask expr: %w", err)
-	}
-
-	mDatum, err := exprs.ExecuteScalarExpression(ctx, schema, gtExpr, compute.NewDatumWithoutOwning(batch))
-	if err != nil {
-		return nil, fmt.Errorf("exec mask: %w", err)
-	}
-	defer mDatum.Release()
-
-	// Convert to Arrow arrays
-	zArr := zDatum.(*compute.ArrayDatum).Value.(arrow.Array)
-	mArr := mDatum.(*compute.ArrayDatum).Value.(arrow.Array)
-
-	// Retain for return
-	zArr.Retain()
-	mArr.Retain()
-
-	// Type assert to the correct types
-	zFloat64 := zArr.(*array.Float64)
-	mBool := mArr.(*array.Boolean)
-
-	return &Result{Mask: mBool, Zscore: zFloat64}, nil
+	return &Result{
+		Mask:   maskBuilder.NewBooleanArray(),
+		Zscore: zscore,
+	}, nil
 }

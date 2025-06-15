@@ -9,7 +9,7 @@ import (
 
 func BenchmarkDetectAnomalies(b *testing.B) {
 	builder := array.NewFloat64Builder(nil)
-	for i := 0; i < 100000; i++ {
+	for i := range 100000 {
 		builder.Append(float64(i))
 	}
 	col := builder.NewFloat64Array()
